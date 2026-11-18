@@ -13,6 +13,8 @@ public:
 	virtual void parseHeader(uint8_t *p, int32_t pLen, int32_t *pwid,
 			int32_t *phei, int32_t *pfps)=0;
 	virtual int32_t decode(YangFrame* pframe,YangYuvType yuvtype,YangDecoderCallback* pcallback)=0;
+	// 可选: 直接把解码结果显示到平台窗口(如 Android ANativeWindow), 默认不支持
+	virtual void setRenderWindow(void *win) { (void) win; }
 	int32_t m_isInit=0;
 	int32_t m_uid = -1;
 	int32_t m_state = 0;

@@ -7,6 +7,7 @@
 #include <android/log.h>
 #include <android/native_window_jni.h>
 #include <pthread.h>
+#include <time.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -66,10 +67,29 @@ struct YangAndroidRtc {
 	YangVideoDecoder *dec;
 	YangRenderCallback cb;
 	YangAndroidRender *render;
+	ANativeWindow *win;
 	pthread_t playThread;
 	volatile int32_t playing;
 	volatile int32_t playStarted;
 	char *playUrl;
+
+	// 解码线程: 收包线程只做入队, 解码+渲染在这里做, 避免阻塞收包
+	pthread_t decThread;
+	volatile int32_t decRunning;
+	volatile int32_t decStarted;
+	pthread_mutex_t decLock;	// 保护 dec 指针
+	pthread_mutex_t qLock;
+	pthread_cond_t qCond;
+	struct VideoPacket {
+		uint8_t *data;
+		int32_t nb;
+		int64_t ptsUs;
+		int32_t keyFrame;
+	};
+	VideoPacket qPkts[4];
+	int32_t qHead;
+	int32_t qTail;
+	int32_t qCount;
 
 	YangAndroidRtc() {
 		pubCtx = NULL;
@@ -79,9 +99,18 @@ struct YangAndroidRtc {
 		recv = NULL;
 		dec = NULL;
 		render = new YangAndroidRender();
+		win = NULL;
 		playing = 0;
 		playStarted = 0;
 		playUrl = NULL;
+
+		decRunning = 0;
+		decStarted = 0;
+		qHead = qTail = qCount = 0;
+		memset(qPkts, 0, sizeof(qPkts));
+		pthread_mutex_init(&decLock, NULL);
+		pthread_mutex_init(&qLock, NULL);
+		pthread_cond_init(&qCond, NULL);
 	}
 
 	~YangAndroidRtc() {
@@ -91,6 +120,9 @@ struct YangAndroidRtc {
 			delete render;
 			render = NULL;
 		}
+		pthread_mutex_destroy(&decLock);
+		pthread_mutex_destroy(&qLock);
+		pthread_cond_destroy(&qCond);
 	}
 
 	void stopPublish();
@@ -150,6 +182,96 @@ void YangAndroidRtc::stopPublish() {
 
 // ---------------------------------------------------------------- 拉流
 
+#define VIDEO_QUEUE_SIZE 4
+
+static void queueClear(YangAndroidRtc *rtc) {
+	pthread_mutex_lock(&rtc->qLock);
+	for (int32_t i = 0; i < rtc->qCount; i++) {
+		int32_t idx = (rtc->qHead + i) % VIDEO_QUEUE_SIZE;
+		free(rtc->qPkts[idx].data);
+		rtc->qPkts[idx].data = NULL;
+	}
+	rtc->qHead = rtc->qTail = rtc->qCount = 0;
+	pthread_mutex_unlock(&rtc->qLock);
+}
+
+// 队列满时丢弃最旧帧, 保证不会无限堆积
+static void queuePush(YangAndroidRtc *rtc, const uint8_t *data, int32_t nb,
+		int64_t ptsUs, int32_t keyFrame) {
+	if (data == NULL || nb <= 0)
+		return;
+
+	uint8_t *copy = (uint8_t *) malloc(nb);
+	if (copy == NULL)
+		return;
+	memcpy(copy, data, nb);
+
+	pthread_mutex_lock(&rtc->qLock);
+	if (rtc->qCount == VIDEO_QUEUE_SIZE) {
+		free(rtc->qPkts[rtc->qHead].data);
+		rtc->qHead = (rtc->qHead + 1) % VIDEO_QUEUE_SIZE;
+		rtc->qCount--;
+	}
+	rtc->qPkts[rtc->qTail].data = copy;
+	rtc->qPkts[rtc->qTail].nb = nb;
+	rtc->qPkts[rtc->qTail].ptsUs = ptsUs;
+	rtc->qPkts[rtc->qTail].keyFrame = keyFrame;
+	rtc->qTail = (rtc->qTail + 1) % VIDEO_QUEUE_SIZE;
+	rtc->qCount++;
+	pthread_cond_signal(&rtc->qCond);
+	pthread_mutex_unlock(&rtc->qLock);
+}
+
+static int32_t queuePop(YangAndroidRtc *rtc, YangAndroidRtc::VideoPacket *out) {
+	pthread_mutex_lock(&rtc->qLock);
+	if (rtc->qCount == 0 && rtc->decRunning) {
+		struct timespec ts;
+		clock_gettime(CLOCK_REALTIME, &ts);
+		ts.tv_nsec += 50 * 1000 * 1000;
+		if (ts.tv_nsec >= 1000000000L) {
+			ts.tv_sec += 1;
+			ts.tv_nsec -= 1000000000L;
+		}
+		pthread_cond_timedwait(&rtc->qCond, &rtc->qLock, &ts);
+	}
+	if (rtc->qCount == 0) {
+		pthread_mutex_unlock(&rtc->qLock);
+		return 0;
+	}
+	*out = rtc->qPkts[rtc->qHead];
+	rtc->qPkts[rtc->qHead].data = NULL;
+	rtc->qHead = (rtc->qHead + 1) % VIDEO_QUEUE_SIZE;
+	rtc->qCount--;
+	pthread_mutex_unlock(&rtc->qLock);
+	return 1;
+}
+
+static void *decodeThreadRun(void *arg) {
+	YangAndroidRtc *rtc = (YangAndroidRtc *) arg;
+	YangFrame frame;
+
+	while (rtc->decRunning) {
+		YangAndroidRtc::VideoPacket pkt;
+		if (!queuePop(rtc, &pkt))
+			continue;
+
+		pthread_mutex_lock(&rtc->decLock);
+		YangVideoDecoder *dec = rtc->dec;
+		if (dec != NULL) {
+			memset(&frame, 0, sizeof(frame));
+			frame.mediaType = YangFrameTypeVideo;
+			frame.frametype = pkt.keyFrame ? YANG_Frametype_I : YANG_Frametype_P;
+			frame.payload = pkt.data;
+			frame.nb = pkt.nb;
+			frame.pts = pkt.ptsUs;
+			dec->decode(&frame, YangI420, &rtc->cb);
+		}
+		pthread_mutex_unlock(&rtc->decLock);
+		free(pkt.data);
+	}
+	return NULL;
+}
+
 static void onRecvVideo(void *user, YangFrame *frame);
 static void onRecvAudio(void *user, YangFrame *frame) {
 	(void) user;
@@ -178,26 +300,31 @@ static void onRecvVideo(void *user, YangFrame *frame) {
 
 	if (rtc == NULL || frame == NULL || frame->payload == NULL || frame->nb <= 0)
 		return;
-	if (rtc->dec == NULL)
+
+	pthread_mutex_lock(&rtc->decLock);
+	YangVideoDecoder *dec = rtc->dec;
+	if (dec == NULL) {
+		pthread_mutex_unlock(&rtc->decLock);
 		return;
+	}
 
 	// 收到 SPS 时解析分辨率, 同时初始化解码器
 	if (rtc->cb.width <= 0 && hasSps(frame->payload, frame->nb)) {
 		int32_t w = 0, h = 0, fps = 0;
-		rtc->dec->parseHeader(frame->payload, frame->nb, &w, &h, &fps);
+		dec->parseHeader(frame->payload, frame->nb, &w, &h, &fps);
 
 		// 硬解初始化失败 (MediaCodec configure/start 失败) -> 回退 FFmpeg 软解
-		if (rtc->dec->m_isInit == 0 && rtc->playCtx->avinfo.video.videoDecHwType != 0) {
+		if (dec->m_isInit == 0 && rtc->playCtx->avinfo.video.videoDecHwType != 0) {
 			ALOGE("hardware decoder init failed, fallback to FFmpeg software decode");
-			delete rtc->dec;
-			rtc->dec = NULL;
+			delete dec;
 			rtc->playCtx->avinfo.video.videoDecHwType = 0;
 			YangDecoderFactory factory;
-			rtc->dec = factory.createVideoDecoder(Yang_VED_H264, &rtc->playCtx->avinfo.video);
-			if (rtc->dec != NULL) {
-				rtc->dec->init();
-				rtc->dec->parseHeader(frame->payload, frame->nb, &w, &h, &fps);
+			dec = factory.createVideoDecoder(Yang_VED_H264, &rtc->playCtx->avinfo.video);
+			if (dec != NULL) {
+				dec->init();
+				dec->parseHeader(frame->payload, frame->nb, &w, &h, &fps);
 			}
+			rtc->dec = dec;
 		}
 
 		if (w > 0 && h > 0) {
@@ -206,9 +333,12 @@ static void onRecvVideo(void *user, YangFrame *frame) {
 			ALOGI("remote video %dx%d @%d", w, h, fps);
 		}
 	}
+	pthread_mutex_unlock(&rtc->decLock);
 
-	if (rtc->dec != NULL)
-		rtc->dec->decode(frame, YangI420, &rtc->cb);
+	// RTP 时间戳是 90kHz, 转成 MediaCodec 需要的微秒
+	int64_t ptsUs = frame->pts * 1000 / 90;
+	queuePush(rtc, frame->payload, frame->nb, ptsUs,
+			frame->frametype == YANG_Frametype_I ? 1 : 0);
 }
 
 static void *playThreadRun(void *arg) {
@@ -216,9 +346,25 @@ static void *playThreadRun(void *arg) {
 	int32_t err;
 
 	YangDecoderFactory factory;
-	rtc->dec = factory.createVideoDecoder(Yang_VED_H264, &rtc->playCtx->avinfo.video);
-	if (rtc->dec != NULL)
-		rtc->dec->init();
+	YangVideoDecoder *dec = factory.createVideoDecoder(Yang_VED_H264,
+			&rtc->playCtx->avinfo.video);
+	if (dec != NULL) {
+		dec->init();
+		// 硬解直接输出到 Surface, 不做 CPU 颜色转换
+		if (rtc->playCtx->avinfo.video.videoDecHwType != 0)
+			dec->setRenderWindow(rtc->win);
+	}
+
+	pthread_mutex_lock(&rtc->decLock);
+	rtc->dec = dec;
+	pthread_mutex_unlock(&rtc->decLock);
+
+	// 启动独立解码线程
+	rtc->decRunning = 1;
+	if (pthread_create(&rtc->decThread, NULL, decodeThreadRun, rtc) == 0)
+		rtc->decStarted = 1;
+	else
+		rtc->decRunning = 0;
 
 	err = yang_whip_connectWhipWhepServer(&rtc->recv->peer, rtc->playUrl);
 	if (err)
@@ -232,10 +378,23 @@ static void *playThreadRun(void *arg) {
 	if (rtc->recv != NULL)
 		rtc->recv->close(&rtc->recv->peer);
 
-	if (rtc->dec != NULL) {
-		delete rtc->dec;
-		rtc->dec = NULL;
+	rtc->decRunning = 0;
+	pthread_mutex_lock(&rtc->qLock);
+	pthread_cond_broadcast(&rtc->qCond);
+	pthread_mutex_unlock(&rtc->qLock);
+	if (rtc->decStarted) {
+		pthread_join(rtc->decThread, NULL);
+		rtc->decStarted = 0;
 	}
+	queueClear(rtc);
+
+	pthread_mutex_lock(&rtc->decLock);
+	dec = rtc->dec;
+	rtc->dec = NULL;
+	pthread_mutex_unlock(&rtc->decLock);
+	if (dec != NULL)
+		delete dec;
+
 	ALOGI("play thread exit");
 	return NULL;
 }
@@ -250,6 +409,7 @@ static int32_t playStart(YangAndroidRtc *rtc, const char *url, ANativeWindow *wi
 		return 1;
 
 	rtc->render->setWindow(win);
+	rtc->win = win;
 	rtc->cb.render = rtc->render;
 	rtc->cb.width = 0;
 	rtc->cb.height = 0;
@@ -319,6 +479,7 @@ void YangAndroidRtc::stopPlay() {
 		playUrl = NULL;
 	}
 	render->setWindow(NULL);
+	win = NULL;
 	cb.width = 0;
 	cb.height = 0;
 }

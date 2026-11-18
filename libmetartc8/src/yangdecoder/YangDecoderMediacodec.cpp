@@ -4,6 +4,7 @@
 
 #include <yangdecoder/YangDecoderMediacodec.h>
 #if Yang_OS_ANDROID
+#include <android/native_window.h>
 #include <yangutil/sys/YangLog.h>
 #include <yangvideo/YangMeta.h>
 #include <yangvideo/YangSpspps.h>
@@ -40,9 +41,14 @@ YangDecoderMediacodec::YangDecoderMediacodec(YangVideoInfo *pcontext,YangVideoCo
 	ret = 0;
 	m_isNv12=yangfalse;
 	m_nv12Buffer=NULL;
+	m_window=NULL;
 }
 YangDecoderMediacodec::~YangDecoderMediacodec() {
 	decode_close();
+}
+
+void YangDecoderMediacodec::setRenderWindow(void *win) {
+	m_window = win;
 }
 
 void YangDecoderMediacodec::parseHeader(uint8_t *p, int32_t pLen, int32_t *pwid,
@@ -96,7 +102,8 @@ void YangDecoderMediacodec::parseHeader(uint8_t *p, int32_t pLen, int32_t *pwid,
 	AMediaFormat_setBuffer(videoFormat, "csd-0", sps.bytes, sps.nb); // sps
 	AMediaFormat_setBuffer(videoFormat, "csd-1", pps.bytes, pps.nb); // pps
 	//这里配置 format
-	media_status_t status = AMediaCodec_configure(m_mediaCodec,videoFormat,NULL,NULL,0);//解码，flags 给0，编码给AMEDIACODEC_CONFIGURE_FLAG_ENCODE
+	// m_window 非空时直接把解码结果输出到 Surface, 省掉 CPU 颜色转换
+	media_status_t status = AMediaCodec_configure(m_mediaCodec,videoFormat,(ANativeWindow*)m_window,NULL,0);//解码，flags 给0，编码给AMEDIACODEC_CONFIGURE_FLAG_ENCODE
 	if(status!=0){
 		AMediaFormat_delete(videoFormat);
 		yang_trace("erro config %d\n",status);
@@ -137,53 +144,44 @@ int32_t YangDecoderMediacodec::decode(YangFrame* videoFrame,YangYuvType yuvtype,
 	if (bufidx >= 0) {
 		// 获取buffer的索引
 		uint8_t* inputBuf = AMediaCodec_getInputBuffer(m_mediaCodec, bufidx, &outsize);
-		if (inputBuf != nullptr && videoFrame->nb <= outsize) {
+		if (inputBuf != nullptr && videoFrame->nb > 0
+				&& (size_t)videoFrame->nb <= outsize) {
 			// 将待解码的数据copy到硬件中
 			memcpy(inputBuf, videoFrame->payload, videoFrame->nb);
 			media_status_t status = AMediaCodec_queueInputBuffer(m_mediaCodec, bufidx, 0, videoFrame->nb, videoFrame->pts, 0);
 			if(AMEDIA_OK!=status){
 				yang_trace("data errorid=%d",status);
 			}
+		} else {
+			// 数据放不下时也要把 buffer 归还, 否则输入 buffer 会永久泄漏直到解码器卡死
+			yang_trace("input buffer too small(nb=%d,size=%d), drop frame",videoFrame->nb,(int32_t)outsize);
+			AMediaCodec_queueInputBuffer(m_mediaCodec, bufidx, 0, 0, videoFrame->pts, 0);
 		}
 	}
-	AMediaCodecBufferInfo info;
-	ssize_t outbufidx = AMediaCodec_dequeueOutputBuffer(m_mediaCodec, &info, 2000);
-	if (outbufidx >= 0) {
-		outsize=0;
-		uint8_t* outputBuf = AMediaCodec_getOutputBuffer(m_mediaCodec, outbufidx, &outsize);
-		if (outputBuf != nullptr) {
 
-			videoFrame->nb=m_yuvLen;
-			tryagainCount=0;
-			if(m_isNv12){
-						if(m_nv12Buffer==NULL) m_nv12Buffer=new uint8_t[m_width*m_height*3/2];
-						nv12ToI420(outputBuf, m_nv12Buffer, m_width, m_height);
-						videoFrame->payload=m_nv12Buffer;
-			}else{
-						videoFrame->payload=outputBuf;
-			}
-			if(pcallback) pcallback->onVideoData(videoFrame);
-			AMediaCodec_releaseOutputBuffer(m_mediaCodec, outbufidx, info.size != 0);
-			return Yang_Ok;
-		}
-	}else{
-		switch (outbufidx) {
-		case AMEDIACODEC_INFO_TRY_AGAIN_LATER:
+	// 一次调用把已经解码好的帧全部取完, 避免内部积压导致延迟持续增长
+	AMediaCodecBufferInfo info;
+	int32_t first = 1;
+	int32_t got = 0;
+	for (;;) {
+		int64_t timeout = first ? 2000 : 0;
+		ssize_t outbufidx = AMediaCodec_dequeueOutputBuffer(m_mediaCodec, &info, timeout);
+		first = 0;
+		if (outbufidx == AMEDIACODEC_INFO_TRY_AGAIN_LATER) {
+			// 本次调用已经取到过帧, 属于正常情况, 不算解码失败
+			if (got) return Yang_Ok;
 			yang_trace("android mediacodec decode error try again(%d)",tryagainCount);
 			tryagainCount++;
 			if(tryagainCount>20){
-				//AMediaCodec_flush(m_mediaCodec);
-				yang_error("android mediacodec decode error try again>40times ,consider fail");
+				yang_error("android mediacodec decode error try again>20times ,consider fail");
 			}
 			return tryagainCount>10?2:1;
-			break;
-		case AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED:
-			// 解码输出的格式发生变化
-		{
+		}
+		if (outbufidx == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
 			auto format = AMediaCodec_getOutputFormat(m_mediaCodec);
 			AMediaFormat_getInt32(format, "width", &m_width);
 			AMediaFormat_getInt32(format, "height", &m_height);
-			int32_t localColorFMT;
+			int32_t localColorFMT = 0;
 			AMediaFormat_getInt32(format, AMEDIAFORMAT_KEY_COLOR_FORMAT, &localColorFMT);
 			if(localColorFMT==21) {
 				m_isNv12=yangtrue;
@@ -192,20 +190,40 @@ int32_t YangDecoderMediacodec::decode(YangFrame* videoFrame,YangYuvType yuvtype,
 			//localColorFMT 19 yuv420p 21 nv12
 			int32_t stride = 0;
 			AMediaFormat_getInt32(format, "stride", &stride);
-			if(stride == 0) {
-				stride = m_width;
-			}
-			tryagainCount=0;
+			if(stride == 0) stride = m_width;
 			yang_trace("change>>>output color fomat=%d,width=%d,height=%d,stride=%d",localColorFMT,m_width,m_height,stride);
+			AMediaFormat_delete(format);
+			continue;
+		}
+		if (outbufidx == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED) continue;
+		if (outbufidx < 0) {
+			// 其它负值: 没有更多输出
+			if (got) return Yang_Ok;
+			return tryagainCount>10?2:1;
+		}
 
-			break;
+		tryagainCount=0;
+		got = 1;
+		if (m_window != NULL) {
+			// 直接渲染到 Surface, 不碰 CPU
+			AMediaCodec_releaseOutputBuffer(m_mediaCodec, outbufidx, true);
+			continue;
 		}
-		case AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED:
-			break;
-		default:
-			return ERROR_CODEC_Decode;
-			break;
+
+		outsize=0;
+		uint8_t* outputBuf = AMediaCodec_getOutputBuffer(m_mediaCodec, outbufidx, &outsize);
+		if (outputBuf != nullptr) {
+			videoFrame->nb=m_yuvLen;
+			if(m_isNv12){
+				if(m_nv12Buffer==NULL) m_nv12Buffer=new uint8_t[m_width*m_height*3/2];
+				nv12ToI420(outputBuf, m_nv12Buffer, m_width, m_height);
+				videoFrame->payload=m_nv12Buffer;
+			}else{
+				videoFrame->payload=outputBuf;
+			}
+			if(pcallback) pcallback->onVideoData(videoFrame);
 		}
+		AMediaCodec_releaseOutputBuffer(m_mediaCodec, outbufidx, info.size != 0);
 	}
 
 	return Yang_Ok;
@@ -220,6 +238,7 @@ void YangDecoderMediacodec::decode_close() {
 		m_mediaCodec=NULL;
 	}
 	yang_deleteA(m_nv12Buffer);
+	m_window = NULL;
 }
 
 #endif

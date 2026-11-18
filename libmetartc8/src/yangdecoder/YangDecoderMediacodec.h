@@ -22,6 +22,8 @@ public:
 	void init();
 	int32_t decode(YangFrame* videoFrame,YangYuvType yuvtype,YangDecoderCallback* pcallback);
 	void decode_close();
+	// 设置后直接解码到该 ANativeWindow(Surface), 不再做 CPU 颜色转换
+	void setRenderWindow(void *win);
 private:
 	YangVideoCodec m_encDecType;
 	YangVideoInfo *m_context;
@@ -31,6 +33,7 @@ private:
 
 	AMediaCodec* m_mediaCodec;
 	uint8_t* m_nv12Buffer;
+	void* m_window;
 
 	int32_t m_width;
 	int32_t m_height;
