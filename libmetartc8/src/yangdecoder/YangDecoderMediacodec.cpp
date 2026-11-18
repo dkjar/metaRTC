@@ -8,6 +8,22 @@
 #include <yangvideo/YangMeta.h>
 #include <yangvideo/YangSpspps.h>
 #include <stdlib.h>
+#include <string.h>
+
+// Android 交叉编译不引入 libyuv, 这里自行把 NV12 转 I420
+static void nv12ToI420(const uint8_t *src, uint8_t *dst, int32_t w, int32_t h) {
+	int32_t ySize = w * h;
+	int32_t uvSize = w * h / 4;
+	const uint8_t *uv = src + ySize;
+	uint8_t *du = dst + ySize;
+	uint8_t *dv = du + uvSize;
+
+	memcpy(dst, src, ySize);
+	for (int32_t i = 0; i < uvSize; i++) {
+		du[i] = uv[i * 2];
+		dv[i] = uv[i * 2 + 1];
+	}
+}
 
 
 YangDecoderMediacodec::YangDecoderMediacodec(YangVideoInfo *pcontext,YangVideoCodec pencdectype) {
@@ -141,7 +157,7 @@ int32_t YangDecoderMediacodec::decode(YangFrame* videoFrame,YangYuvType yuvtype,
 			tryagainCount=0;
 			if(m_isNv12){
 						if(m_nv12Buffer==NULL) m_nv12Buffer=new uint8_t[m_width*m_height*3/2];
-						m_yuv.nv12toI420(outputBuf, m_nv12Buffer, m_width, m_height);
+						nv12ToI420(outputBuf, m_nv12Buffer, m_width, m_height);
 						videoFrame->payload=m_nv12Buffer;
 			}else{
 						videoFrame->payload=outputBuf;

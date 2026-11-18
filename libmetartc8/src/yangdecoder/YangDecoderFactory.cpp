@@ -46,7 +46,13 @@ YangVideoDecoder* YangDecoderFactory::createFfmpegVideoDecoder(YangVideoCodec vc
 }
 #endif
 YangVideoDecoder* YangDecoderFactory::createVideoDecoder(YangVideoCodec vcodec,YangVideoInfo *videoInfo){
-
+#if Yang_OS_ANDROID
+    // Android: videoDecHwType==0 走 FFmpeg 软解, 否则走 MediaCodec 硬解
+    if(videoInfo->videoDecHwType==0){
+        return new YangVideoDecoderFfmpeg(videoInfo,vcodec);
+    }
+    return new YangDecoderMediacodec(videoInfo,vcodec);
+#else
    if(videoInfo->videoDecHwType==0){
 #if	Yang_Enable_H264Decoder
         return new YangH264DecoderSoft();
@@ -54,9 +60,7 @@ YangVideoDecoder* YangDecoderFactory::createVideoDecoder(YangVideoCodec vcodec,Y
         return new YangVideoDecoderFfmpeg(videoInfo,vcodec);
 #endif
    }else{
-#if Yang_OS_ANDROID
-        return new YangDecoderMediacodec(videoInfo,vcodec);
-#elif Yang_OS_APPLE
+#if Yang_OS_APPLE
         return new YangVideoDecoderMac();
 #else
         return new YangVideoDecoderFfmpeg(videoInfo,vcodec);
@@ -64,6 +68,7 @@ YangVideoDecoder* YangDecoderFactory::createVideoDecoder(YangVideoCodec vcodec,Y
 
    }
 	return NULL;
+#endif
 }
 
 YangVideoDecoder* YangDecoderFactory::createVideoDecoder(YangVideoInfo *videoInfo){

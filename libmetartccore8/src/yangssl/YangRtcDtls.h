@@ -76,6 +76,7 @@ typedef struct {
 
 	BIO* bioIn;
 	BIO* bioOut;
+	yang_thread_mutex_t sslLock;
 #else
 	YangMbedTimer mbtimer;
 	mbedtls_ssl_context* ssl;

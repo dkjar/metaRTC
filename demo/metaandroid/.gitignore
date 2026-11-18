@@ -1,0 +1,21 @@
+# gradle / android studio
+.gradle/
+.kotlin/
+build/
+local.properties
+local.properties.bak
+*.iml
+.idea/
+.cxx/
+androidApp/build/
+shared/build/
+
+# native 中间产物
+build_android/
+*.o
+*.a
+*.so
+
+# apk
+*.apk
+*.aab

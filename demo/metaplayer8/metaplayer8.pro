@@ -53,7 +53,9 @@ unix:!macx{
     }
  LIBS +=  -L$$HOME_BASE/thirdparty/lib
 
- LIBS += -lmetartc8 -lyangwhip8 -lmetartccore8 -lyangutil8 -lyuv -lspeexdsp -lavutil -lavcodec -lopus -lusrsctp -lpthread  -ldl
+ LIBS += -lmetartc8 -lyangwhip8 -lmetartccore8 -lyangutil8 -lyuv -lavutil -lavcodec -lopus -lusrsctp -lpthread  -ldl
+# 未装 libspeexdsp-dev 时直接链带版本号的 so
+ LIBS += -l:libspeexdsp.so.1
 
 #linux
 LIBS += -lasound

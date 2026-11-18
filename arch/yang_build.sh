@@ -2,6 +2,7 @@
 yang_moc=2
 yang_bit=64
 yang_pic=1
+yang_nocapture=0
 
 if [ $1 ];then
 yang_moc=$1
@@ -57,5 +58,12 @@ fi
 if [ $yang_moc -eq 7 ];then
 	
 	ARCH=ios64.cmake
+
+fi
+
+if [ $yang_moc -eq 8 ];then
+	
+	ARCH=hisi_arm32.cmake
+	yang_nocapture=1
 
 fi

@@ -1,0 +1,8 @@
+SET(CMAKE_SYSTEM_NAME Linux)
+SET(CMAKE_SYSTEM_PROCESSOR arm)
+SET(CMAKE_C_COMPILER /home/dkjar/open/arm-v01c02-linux-musleabi/arm-v01c02-linux-musleabi-gcc/bin/arm-linux-musleabi-gcc)
+SET(CMAKE_CXX_COMPILER /home/dkjar/open/arm-v01c02-linux-musleabi/arm-v01c02-linux-musleabi-gcc/bin/arm-linux-musleabi-g++)
+SET(CMAKE_FIND_ROOT_PATH /home/dkjar/open/arm-v01c02-linux-musleabi/arm-v01c02-linux-musleabi-gcc/arm-linux-musleabi)
+SET(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+SET(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+SET(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)

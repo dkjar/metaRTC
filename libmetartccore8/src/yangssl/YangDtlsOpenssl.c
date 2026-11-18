@@ -161,7 +161,10 @@ int32_t yang_run_rtcdtls_app(YangDtlsSession *dtls) {
 		// and returns one. Otherwise, it returns zero.
 		int32_t r0 = 0;
 		struct timeval to = { 0 };
-		if ((r0 = DTLSv1_get_timeout(dtls->ssl, &to)) == 0) {
+		yang_thread_mutex_lock(&dtls->sslLock);
+		r0 = DTLSv1_get_timeout(dtls->ssl, &to);
+		yang_thread_mutex_unlock(&dtls->sslLock);
+		if (r0 == 0) {
 			// No timeout, for example?, wait for a default 50ms.
 			yang_usleep(50 * YANG_UTIME_MILLISECONDS);
 			continue;
@@ -175,9 +178,12 @@ int32_t yang_run_rtcdtls_app(YangDtlsSession *dtls) {
 			continue;
 		}
 
+		yang_thread_mutex_lock(&dtls->sslLock);
+
 		r0 = BIO_reset(dtls->bioOut);
 		int32_t r1 = SSL_get_error(dtls->ssl, r0);
 		if (r0 != 1) {
+			yang_thread_mutex_unlock(&dtls->sslLock);
 			return yang_error_wrap(ERROR_OpenSslBIOReset,
 					"OpenSslBIORese BIO_reset r0=%d, r1=%d", r0, r1);
 		}
@@ -185,9 +191,18 @@ int32_t yang_run_rtcdtls_app(YangDtlsSession *dtls) {
 		r0 = DTLSv1_handle_timeout(dtls->ssl);
 		r1 = SSL_get_error(dtls->ssl, r0);
 		if (r0 == 0) {
+			yang_thread_mutex_unlock(&dtls->sslLock);
 			continue; // No timeout had expired.
 		}
 		if (r0 != 1) {
+			unsigned long sslErr;
+			char errBuf[256];
+
+			while ((sslErr = ERR_get_error()) != 0) {
+				ERR_error_string_n(sslErr, errBuf, sizeof(errBuf));
+				yang_error("dtls ssl error: %s", errBuf);
+			}
+			yang_thread_mutex_unlock(&dtls->sslLock);
 			return yang_error_wrap(ERROR_RTC_DTLS,
 					"dtls error ARQ r0=%d, r1=%d", r0, r1);
 
@@ -197,9 +212,20 @@ int32_t yang_run_rtcdtls_app(YangDtlsSession *dtls) {
 		int32_t size = BIO_get_mem_data(dtls->bioOut, (char** )&data);
 		arq_count++;
 
-		if (size > 0&& (err = dtls->sock->write(&dtls->sock->session,(char*)data, size)) != Yang_Ok) {
-			return yang_error_wrap(ERROR_RTC_DTLS, "error dtls send size=%u",size);
+		if (size > 0) {
+			// 调试: ARQ 线程的重发
+			static int32_t dtlsArqDbg = 0;
+			if (dtlsArqDbg < 20) {
+				dtlsArqDbg++;
+				yang_error("dtls arq resend: size=%d", size);
+			}
+			if ((err = dtls->sock->write(&dtls->sock->session,(char*)data, size)) != Yang_Ok) {
+				yang_thread_mutex_unlock(&dtls->sslLock);
+				return yang_error_wrap(ERROR_RTC_DTLS, "error dtls send size=%u",size);
+			}
 		}
+
+		yang_thread_mutex_unlock(&dtls->sslLock);
 	}
 	dtls->isStart = yangfalse;
 	return Yang_Ok;
@@ -307,9 +333,12 @@ int32_t yang_dtls_on_handshake_done(YangDtlsSession *dtls) {
 	return err;
 }
 int32_t yang_dtls_doHandshake(YangDtlsSession *dtls) {
+	int32_t wret;
 	if (dtls->handshake_done) {
 		return Yang_Ok;
 	}
+
+	yang_thread_mutex_lock(&dtls->sslLock);
 
 	int32_t r0 = SSL_do_handshake(dtls->ssl);
 	int32_t r1 = SSL_get_error(dtls->ssl, r0);
@@ -318,6 +347,7 @@ int32_t yang_dtls_doHandshake(YangDtlsSession *dtls) {
 	if (r0 < 0&& (r1 != SSL_ERROR_NONE && r1 != SSL_ERROR_WANT_READ
 					&& r1 != SSL_ERROR_WANT_WRITE)) {
 		yang_error("ERROR_RTC_DTLS, handshake r0=%d, r1=%d\n", r0, r1);
+		yang_thread_mutex_unlock(&dtls->sslLock);
 		return ERROR_RTC_DTLS;
 	}
 
@@ -328,9 +358,31 @@ int32_t yang_dtls_doHandshake(YangDtlsSession *dtls) {
 	uint8_t *data = NULL;
 	int32_t size = BIO_get_mem_data(dtls->bioOut, (char** )&data);
 
+	{
+		// 调试: 观察 OpenSSL 握手推进情况与待发送数据量
+		static int32_t dtlsHsDbg = 0;
+		if (dtlsHsDbg < 30) {
+			dtlsHsDbg++;
+			yang_error("dtls handshake: r0=%d r1=%d outSize=%d state=%d",
+					r0, r1, size, dtls->state);
+		}
+	}
+
 	yang_dtls_filter_data(dtls, data, size);
 
-	if (size > 0)	dtls->sock->write(&dtls->sock->session, (char*) data, size);
+	if (size > 0) {
+		// 调试: 确认客户端 DTLS 握手报文是否发出
+		static int32_t dtlsTxDbg = 0;
+		if (dtlsTxDbg < 20) {
+			dtlsTxDbg++;
+			yang_error("dtls send flight: size=%d", size);
+		}
+		wret = dtls->sock->write(&dtls->sock->session, (char*) data, size);
+		if (wret != Yang_Ok)
+			yang_error("dtls send flight failure: ret=%d size=%d", wret, size);
+	}
+
+	yang_thread_mutex_unlock(&dtls->sslLock);
 
 
 
@@ -353,14 +405,27 @@ int32_t yang_process_dtls_data(void* user,YangDtlsSession *dtls, char *data, int
 	int32_t r0 = 0,r1;
 	int32_t err = 0;
 
+	{
+		// 调试: 进入 DTLS 处理的报文
+		static int32_t dtlsRxDbg = 0;
+		if (dtlsRxDbg < 12) {
+			dtlsRxDbg++;
+			yang_error("dtls processData in: nb=%d state=%d", nb_data, dtls->state);
+		}
+	}
+
+	yang_thread_mutex_lock(&dtls->sslLock);
+
 	if ((r0 = BIO_reset(dtls->bioIn)) != 1) {
 		yang_error("ERROR_OpenSslBIOReset, BIO_in reset r0=%d", r0);
+		yang_thread_mutex_unlock(&dtls->sslLock);
 		return ERROR_RTC_DTLS;
 	}
 
 
 	if ((r0 = BIO_reset(dtls->bioOut)) != 1) {
 		yang_error("ERROR_OpenSslBIOReset, BIO_out reset r0=%d", r0);
+		yang_thread_mutex_unlock(&dtls->sslLock);
 		return ERROR_RTC_DTLS;
 	}
 
@@ -369,13 +434,18 @@ int32_t yang_process_dtls_data(void* user,YangDtlsSession *dtls, char *data, int
 	if ((r0 = BIO_write(dtls->bioIn, data, nb_data)) <= 0) {
 
 		yang_error("\nERROR_OpenSslBIOWrite, BIO_write r0=%d", r0);
+		yang_thread_mutex_unlock(&dtls->sslLock);
 		return ERROR_RTC_DTLS;
 	}
 
+	// doHandshake 内部会加同一把锁, 这里必须先释放, 避免重复加锁
+	yang_thread_mutex_unlock(&dtls->sslLock);
 
 	if ((err = yang_dtls_doHandshake(dtls) != Yang_Ok)) {
 		return ERROR_RTC_DTLS;
 	}
+
+	yang_thread_mutex_lock(&dtls->sslLock);
 
 	for (i = 0; i < 1024 && BIO_ctrl_pending(dtls->bioIn) > 0; i++) {
 		char buf[8092];
@@ -407,6 +477,8 @@ int32_t yang_process_dtls_data(void* user,YangDtlsSession *dtls, char *data, int
 
 	}
 
+	yang_thread_mutex_unlock(&dtls->sslLock);
+
 	return Yang_Ok;
 }
 
@@ -414,6 +486,8 @@ int32_t yang_sendDtlsAlert(YangDtlsSession *dtls) {
 	int32_t r0,r1;
 	if (!dtls)
 		return ERROR_RTC_DTLS;
+
+	yang_thread_mutex_lock(&dtls->sslLock);
 	r0 = SSL_shutdown(dtls->ssl);
 	r1 = SSL_get_error(dtls->ssl, r0);
 	// Fatal SSL error, for example, no available suite when peer is DTLS 1.0 while we are DTLS 1.2.
@@ -421,6 +495,7 @@ int32_t yang_sendDtlsAlert(YangDtlsSession *dtls) {
 			&& (r1 != SSL_ERROR_NONE && r1 != SSL_ERROR_WANT_READ
 					&& r1 != SSL_ERROR_WANT_WRITE)) {
 		yang_error("\nERROR_RTC_DTLS, handshake r0=%d, r1=%d\n", r0, r1);
+		yang_thread_mutex_unlock(&dtls->sslLock);
 		return ERROR_RTC_DTLS;
 	}
 
@@ -428,6 +503,7 @@ int32_t yang_sendDtlsAlert(YangDtlsSession *dtls) {
 	int32_t size = BIO_get_mem_data(dtls->bioOut, (char** )&data);
 	if (size > 0 && dtls->sock)
 		dtls->sock->write(&dtls->sock->session, (char*) data, size);
+	yang_thread_mutex_unlock(&dtls->sslLock);
 
 	return Yang_Ok;
 }
@@ -478,6 +554,9 @@ int32_t yang_create_rtcdtls(YangRtcDtls *pdtls,int32_t isControlled) {
 	dtls->isLoop = yangfalse;
 
 	dtls->isControlled = isControlled;
+
+	// 保护 SSL 对象和 bioIn/bioOut: 接收线程与 ARQ 线程会并发访问
+	yang_thread_mutex_init(&dtls->sslLock, NULL);
 
 	dtls->state = YangDtlsStateInit;
 
@@ -547,6 +626,7 @@ void yang_destroy_rtcdtls(YangRtcDtls *dtls) {
 		// this function will free bio_in and bio_out
 		SSL_free(dtls->session.ssl);
 		dtls->session.ssl = NULL;
+		yang_thread_mutex_destroy(&dtls->session.sslLock);
 	}
 }
 

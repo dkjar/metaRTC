@@ -451,6 +451,15 @@ static void yang_rtcconn_receive(YangRtcSession *session, char *data, int32_t si
 
 #if Yang_Enable_Dtls
 			if(session->context.dtls==NULL) return;
+			{
+				// 调试: 确认 DTLS 包是否真的进入本进程(前 10 个)
+				static int32_t dtlsDbgCnt = 0;
+				if (dtlsDbgCnt < 10) {
+					dtlsDbgCnt++;
+					yang_error("recv dtls packet: bt=%d size=%d connState=%d dtlsState=%d",
+							bt, size, session->context.state, session->context.dtls->session.state);
+				}
+			}
 #if Yang_Enable_Datachannel
 			if (session->context.dtls->processData(session->datachannel,&session->context.dtls->session, data,size) == Yang_Ok && session->context.state == Yang_Conn_State_Connecting) {
 #else

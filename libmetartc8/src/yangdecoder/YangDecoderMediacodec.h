@@ -6,7 +6,7 @@
 #define YANGDECODERYANGVIDEODECODERAndroid_H_
 #include <yangdecoder/YangAudioDecoderHandles.h>
 #include <yangdecoder/YangVideoDecoder.h>
-#include <yangavutil/video/YangYuvConvert.h>
+
 #include <yangutil/sys/YangLoadLib.h>
 #include <yangutil/yangavinfotype.h>
 
@@ -38,8 +38,6 @@ private:
 	int32_t yLen;
 	int32_t uLen;
 	int32_t tryagainCount;
-
-	YangYuvConvert m_yuv;
 };
 #endif
 #endif /* YANGDECODER_SRC_YANGH2645VIDEODECODERFFMPEG_H_ */

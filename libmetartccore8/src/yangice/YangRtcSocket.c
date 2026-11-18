@@ -13,11 +13,20 @@
 
 int32_t yang_rtcsock_sendData(YangRtcSocketSession *session, char *data, int32_t nb) {
 	int32_t err = Yang_Ok;
-	if (session == NULL || session->fd == -1 || session->notRemoteInit || data==NULL)
+	if (session == NULL || session->fd == -1 || session->notRemoteInit || data==NULL) {
+		yang_error("rtcsock send invalid: fd=%d remoteInit=%d nb=%d",
+				session ? session->fd : -1,
+				session ? session->notRemoteInit : -1, nb);
 		return ERROR_RTC_SOCKET;
+	}
 
 	yang_thread_mutex_lock(&session->sendLock);
-	err=yang_socket_sendto(session->fd, data, nb, &session->remote_addr,0) > 0 ? Yang_Ok : ERROR_RTC_SOCKET;
+	{
+		int32_t r0 = yang_socket_sendto(session->fd, data, nb, &session->remote_addr,0);
+		err = r0 > 0 ? Yang_Ok : ERROR_RTC_SOCKET;
+		if (r0 <= 0)
+			yang_error("rtcsock sendto failure: nb=%d remotePort=%d", nb, session->remote_addr.port);
+	}
 	yang_thread_mutex_unlock(&session->sendLock);
 
 	return err;

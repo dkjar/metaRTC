@@ -8,9 +8,9 @@ cd build
 
 
 if [ $yang_pic -eq 1 ];then
-cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DCMAKE_TOOLCHAIN_FILE=../../arch/$ARCH  ..
+cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DNoCapture=${yang_nocapture} -DCMAKE_TOOLCHAIN_FILE=../../arch/$ARCH  ..
 else
-cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=../../arch/$ARCH  ..
+cmake -DCMAKE_BUILD_TYPE=Release -DNoCapture=${yang_nocapture} -DCMAKE_TOOLCHAIN_FILE=../../arch/$ARCH  ..
 fi
 make
 if [ ! -d "../../bin/lib_debug" ] ; then
