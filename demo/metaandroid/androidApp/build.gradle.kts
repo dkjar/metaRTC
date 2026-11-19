@@ -1,3 +1,5 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -9,7 +11,7 @@ val metaRtcRoot: String = rootProject.projectDir.parentFile.parentFile.absoluteP
 
 android {
     namespace = "org.meta.rtc.demo"
-    compileSdk = 34
+    compileSdk = 36
     buildToolsVersion = "36.0.0"
     ndkVersion = "25.1.8937393"
 
@@ -50,9 +52,11 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
+}
 
-    kotlinOptions {
-        jvmTarget = "17"
+kotlin {
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_17)
     }
 }
 

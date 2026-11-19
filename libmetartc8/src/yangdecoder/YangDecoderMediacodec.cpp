@@ -1,6 +1,15 @@
 ﻿//
 // Copyright (c) 2019-2026 yanggaofeng
 //
+// 变更备注:
+//   2026-11-16  新增 setRenderWindow(): 配置 ANativeWindow 时解码结果直出 Surface,
+//               省掉 NV12->I420 与逐像素 I420->RGBA 两遍 CPU 转换;
+//               decode() 改为一次调用排空所有输出帧;
+//               输入 buffer 放不下时归还, 修复输入 buffer 泄漏
+//   2026-11-19  设置 AMEDIAFORMAT_KEY_MAX_INPUT_SIZE, 避免 1080p I 帧超限被丢弃;
+//               检查 AMediaCodec_start 返回值, 失败时不再置 m_isInit,
+//               保证上层可以回退到 FFmpeg 软解
+//
 
 #include <yangdecoder/YangDecoderMediacodec.h>
 #if Yang_OS_ANDROID
@@ -101,6 +110,9 @@ void YangDecoderMediacodec::parseHeader(uint8_t *p, int32_t pLen, int32_t *pwid,
 	AMediaFormat_setInt32(videoFormat, AMEDIAFORMAT_KEY_HEIGHT, m_height); // 视频高度
 	AMediaFormat_setBuffer(videoFormat, "csd-0", sps.bytes, sps.nb); // sps
 	AMediaFormat_setBuffer(videoFormat, "csd-1", pps.bytes, pps.nb); // pps
+	// 关键帧可能很大, 显式给出输入 buffer 上限, 避免 I 帧放不下被丢弃
+	AMediaFormat_setInt32(videoFormat, AMEDIAFORMAT_KEY_MAX_INPUT_SIZE,
+			m_width * m_height > 512 * 1024 ? m_width * m_height : 512 * 1024);
 	//这里配置 format
 	// m_window 非空时直接把解码结果输出到 Surface, 省掉 CPU 颜色转换
 	media_status_t status = AMediaCodec_configure(m_mediaCodec,videoFormat,(ANativeWindow*)m_window,NULL,0);//解码，flags 给0，编码给AMEDIACODEC_CONFIGURE_FLAG_ENCODE
@@ -111,8 +123,10 @@ void YangDecoderMediacodec::parseHeader(uint8_t *p, int32_t pLen, int32_t *pwid,
 	}
 
 	AMediaFormat_delete(videoFormat);
-	AMediaCodec_start(m_mediaCodec);
-	if(status!=0){
+	// 备注(2026-11-19): 必须检查 start 的返回值, 否则启动失败也会把 m_isInit 置 1,
+	// 上层就永远触发不了 FFmpeg 软解回退
+	status = AMediaCodec_start(m_mediaCodec);
+	if(status!=AMEDIA_OK){
 		yang_trace("start erro %d\n",status);
 		goto ret;
 	}

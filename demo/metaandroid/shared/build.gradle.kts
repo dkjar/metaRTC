@@ -1,3 +1,5 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
 plugins {
     id("com.android.library")
     id("org.jetbrains.kotlin.multiplatform")
@@ -5,10 +7,8 @@ plugins {
 
 kotlin {
     androidTarget {
-        compilations.all {
-            kotlinOptions {
-                jvmTarget = "17"
-            }
+        compilerOptions {
+            jvmTarget.set(JvmTarget.JVM_17)
         }
     }
 
@@ -20,7 +20,7 @@ kotlin {
 
 android {
     namespace = "org.meta.rtc"
-    compileSdk = 34
+    compileSdk = 36
 
     defaultConfig {
         minSdk = 29

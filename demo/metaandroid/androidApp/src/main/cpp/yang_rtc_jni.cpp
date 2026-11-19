@@ -1,7 +1,14 @@
 //
 // metaRTC Android JNI 桥接
 //   推流: Kotlin(CameraX + MediaCodec) 产出 H.264 Annex-B -> sendH264Frame -> WHIP
-//   拉流: WHEP 收流 -> MediaCodec(NDK) 解码 -> I420 直接画到 SurfaceView
+//   拉流: WHEP 收流 -> MediaCodec(NDK) 硬解 -> 直出 Surface
+//         (硬解不可用时回退 FFmpeg 软解 -> I420 -> ANativeWindow)
+//
+// 变更备注:
+//   2026-11-16  解码从收包线程移到独立线程(4 帧有界队列, 满则丢最旧);
+//               硬解改为 Surface 直出; RTP 90kHz 时间戳转微秒后再给 MediaCodec
+//   2026-11-19  增加 rx/dec/drop 每 5 秒统计日志, 用于定位拉流卡顿;
+//               队列溢出改为「丢到下一个关键帧 + 请求 PLI」, 修复快速运动花屏
 //
 #include <jni.h>
 #include <android/log.h>
@@ -27,6 +34,7 @@
 
 #define LOG_TAG "YangRtcJni"
 #define ALOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define ALOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define ALOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 // ---------------------------------------------------------------- 结构
@@ -90,6 +98,17 @@ struct YangAndroidRtc {
 	int32_t qHead;
 	int32_t qTail;
 	int32_t qCount;
+	// 队列溢出后进入「丢弃直到下一个关键帧」模式:
+	// H.264 是帧间预测, 丢任意 P 帧会让后续帧失去参考 -> 花屏,
+	// 所以宁可短暂停顿, 也不能丢中间帧
+	volatile int32_t skipUntilKey;
+
+	// 统计: 收到的帧 / 解码的帧 / 队列丢弃的帧
+	// 备注(2026-11-19): 每 5 秒打印一次, 用于区分「收流丢包 / 解码慢 / 队列溢出」
+	volatile int64_t statRx;
+	volatile int64_t statDec;
+	volatile int64_t statDrop;
+	volatile int64_t lastPliMs;	// PLI 限频
 
 	YangAndroidRtc() {
 		pubCtx = NULL;
@@ -106,6 +125,11 @@ struct YangAndroidRtc {
 
 		decRunning = 0;
 		decStarted = 0;
+		skipUntilKey = 0;
+		statRx = 0;
+		statDec = 0;
+		statDrop = 0;
+		lastPliMs = 0;
 		qHead = qTail = qCount = 0;
 		memset(qPkts, 0, sizeof(qPkts));
 		pthread_mutex_init(&decLock, NULL);
@@ -184,18 +208,42 @@ void YangAndroidRtc::stopPublish() {
 
 #define VIDEO_QUEUE_SIZE 4
 
-static void queueClear(YangAndroidRtc *rtc) {
-	pthread_mutex_lock(&rtc->qLock);
+// 调用方需持有 qLock
+static void queueClearLocked(YangAndroidRtc *rtc) {
 	for (int32_t i = 0; i < rtc->qCount; i++) {
 		int32_t idx = (rtc->qHead + i) % VIDEO_QUEUE_SIZE;
 		free(rtc->qPkts[idx].data);
 		rtc->qPkts[idx].data = NULL;
 	}
 	rtc->qHead = rtc->qTail = rtc->qCount = 0;
+}
+
+static void queueClear(YangAndroidRtc *rtc) {
+	pthread_mutex_lock(&rtc->qLock);
+	queueClearLocked(rtc);
 	pthread_mutex_unlock(&rtc->qLock);
 }
 
-// 队列满时丢弃最旧帧, 保证不会无限堆积
+// 主动请求关键帧(PLI), 让对端尽快重发 IDR, 缩短丢帧后的恢复时间
+// 1 秒内最多请求一次, 避免拥塞时 PLI 风暴(IDR 本身也很大)
+static void requestKeyFrame(YangAndroidRtc *rtc) {
+	struct timespec ts;
+	int64_t nowMs;
+
+	if (rtc->recv == NULL || rtc->recv->sendRequestPli == NULL)
+		return;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	nowMs = (int64_t) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+	if (rtc->lastPliMs != 0 && nowMs - rtc->lastPliMs < 1000)
+		return;
+	rtc->lastPliMs = nowMs;
+
+	rtc->recv->sendRequestPli(&rtc->recv->peer);
+}
+
+// 入队。溢出时不再丢单个 P 帧(会破坏参考链导致花屏),
+// 而是清空队列并丢到下一个关键帧为止, 同时请求 PLI
 static void queuePush(YangAndroidRtc *rtc, const uint8_t *data, int32_t nb,
 		int64_t ptsUs, int32_t keyFrame) {
 	if (data == NULL || nb <= 0)
@@ -207,11 +255,39 @@ static void queuePush(YangAndroidRtc *rtc, const uint8_t *data, int32_t nb,
 	memcpy(copy, data, nb);
 
 	pthread_mutex_lock(&rtc->qLock);
-	if (rtc->qCount == VIDEO_QUEUE_SIZE) {
-		free(rtc->qPkts[rtc->qHead].data);
-		rtc->qHead = (rtc->qHead + 1) % VIDEO_QUEUE_SIZE;
-		rtc->qCount--;
+
+	// 跳过模式: 只接收关键帧
+	if (rtc->skipUntilKey) {
+		if (!keyFrame) {
+			free(copy);
+			rtc->statDrop++;
+			pthread_mutex_unlock(&rtc->qLock);
+			return;
+		}
+		queueClearLocked(rtc);
+		rtc->skipUntilKey = 0;
 	}
+
+	if (rtc->qCount == VIDEO_QUEUE_SIZE) {
+		int32_t dropped = rtc->qCount;
+		queueClearLocked(rtc);
+		rtc->statDrop += dropped;
+
+		if (keyFrame) {
+			// 溢出的正好是关键帧, 清空后直接用它重新开始
+			rtc->skipUntilKey = 0;
+		} else {
+			// 丢掉当前 P 帧和后续所有 P 帧, 等下一个 IDR
+			free(copy);
+			rtc->statDrop++;
+			rtc->skipUntilKey = 1;
+			pthread_mutex_unlock(&rtc->qLock);
+			ALOGW("decoder queue overflow, skip to next keyframe");
+			requestKeyFrame(rtc);
+			return;
+		}
+	}
+
 	rtc->qPkts[rtc->qTail].data = copy;
 	rtc->qPkts[rtc->qTail].nb = nb;
 	rtc->qPkts[rtc->qTail].ptsUs = ptsUs;
@@ -249,25 +325,45 @@ static int32_t queuePop(YangAndroidRtc *rtc, YangAndroidRtc::VideoPacket *out) {
 static void *decodeThreadRun(void *arg) {
 	YangAndroidRtc *rtc = (YangAndroidRtc *) arg;
 	YangFrame frame;
+	int64_t lastRx = 0, lastDec = 0, lastDrop = 0;
+	struct timespec lastTs, nowTs;
+	clock_gettime(CLOCK_MONOTONIC, &lastTs);
 
 	while (rtc->decRunning) {
 		YangAndroidRtc::VideoPacket pkt;
-		if (!queuePop(rtc, &pkt))
-			continue;
-
-		pthread_mutex_lock(&rtc->decLock);
-		YangVideoDecoder *dec = rtc->dec;
-		if (dec != NULL) {
-			memset(&frame, 0, sizeof(frame));
-			frame.mediaType = YangFrameTypeVideo;
-			frame.frametype = pkt.keyFrame ? YANG_Frametype_I : YANG_Frametype_P;
-			frame.payload = pkt.data;
-			frame.nb = pkt.nb;
-			frame.pts = pkt.ptsUs;
-			dec->decode(&frame, YangI420, &rtc->cb);
+		if (queuePop(rtc, &pkt)) {
+			pthread_mutex_lock(&rtc->decLock);
+			YangVideoDecoder *dec = rtc->dec;
+			if (dec != NULL) {
+				memset(&frame, 0, sizeof(frame));
+				frame.mediaType = YangFrameTypeVideo;
+				frame.frametype = pkt.keyFrame ? YANG_Frametype_I : YANG_Frametype_P;
+				frame.payload = pkt.data;
+				frame.nb = pkt.nb;
+				frame.pts = pkt.ptsUs;
+				if (dec->decode(&frame, YangI420, &rtc->cb) == 2) {
+					// 解码器持续取不到输出, 请求关键帧重新同步
+					requestKeyFrame(rtc);
+				}
+				rtc->statDec++;
+			}
+			pthread_mutex_unlock(&rtc->decLock);
+			free(pkt.data);
 		}
-		pthread_mutex_unlock(&rtc->decLock);
-		free(pkt.data);
+
+		clock_gettime(CLOCK_MONOTONIC, &nowTs);
+		int64_t elapsedMs = (nowTs.tv_sec - lastTs.tv_sec) * 1000
+				+ (nowTs.tv_nsec - lastTs.tv_nsec) / 1000000;
+		if (elapsedMs >= 5000) {
+			int64_t rx = rtc->statRx, dc = rtc->statDec, dp = rtc->statDrop;
+			ALOGI("play stats: rx=%lld dec=%lld drop=%lld in %lldms",
+					(long long) (rx - lastRx), (long long) (dc - lastDec),
+					(long long) (dp - lastDrop), (long long) elapsedMs);
+			lastRx = rx;
+			lastDec = dc;
+			lastDrop = dp;
+			lastTs = nowTs;
+		}
 	}
 	return NULL;
 }
@@ -337,6 +433,7 @@ static void onRecvVideo(void *user, YangFrame *frame) {
 
 	// RTP 时间戳是 90kHz, 转成 MediaCodec 需要的微秒
 	int64_t ptsUs = frame->pts * 1000 / 90;
+	rtc->statRx++;
 	queuePush(rtc, frame->payload, frame->nb, ptsUs,
 			frame->frametype == YANG_Frametype_I ? 1 : 0);
 }
@@ -358,6 +455,9 @@ static void *playThreadRun(void *arg) {
 	pthread_mutex_lock(&rtc->decLock);
 	rtc->dec = dec;
 	pthread_mutex_unlock(&rtc->decLock);
+
+	ALOGI("decoder=%s", rtc->playCtx->avinfo.video.videoDecHwType != 0
+			? "mediacodec(surface)" : "ffmpeg(soft)");
 
 	// 启动独立解码线程
 	rtc->decRunning = 1;
@@ -411,6 +511,7 @@ static int32_t playStart(YangAndroidRtc *rtc, const char *url, ANativeWindow *wi
 	rtc->render->setWindow(win);
 	rtc->win = win;
 	rtc->cb.render = rtc->render;
+	rtc->skipUntilKey = 0;
 	rtc->cb.width = 0;
 	rtc->cb.height = 0;
 

@@ -72,10 +72,10 @@ private fun MainScreen() {
     val scope = rememberCoroutineScope()
 
     var whipUrl by remember {
-        mutableStateOf("http://192.168.100.188:1985/rtc/v1/whip/?app=live&stream=livestream")
+        mutableStateOf("http://47.76.137.109:1985/rtc/v1/whip/?app=live&stream=livestream")
     }
     var whepUrl by remember {
-        mutableStateOf("http://192.168.100.188:1985/rtc/v1/whep/?app=live&stream=livestream")
+        mutableStateOf("http://47.76.137.109:1985/rtc/v1/whep/?app=live&stream=livestream")
     }
 
     val rtc = remember { YangRtc() }
