@@ -8,7 +8,8 @@
 //   2026-11-16  解码从收包线程移到独立线程(4 帧有界队列, 满则丢最旧);
 //               硬解改为 Surface 直出; RTP 90kHz 时间戳转微秒后再给 MediaCodec
 //   2026-11-19  增加 rx/dec/drop 每 5 秒统计日志, 用于定位拉流卡顿;
-//               队列溢出改为「丢到下一个关键帧 + 请求 PLI」, 修复快速运动花屏
+//               队列溢出改为「丢到下一个关键帧 + 请求 PLI」, 修复快速运动花屏;
+//               PLI 改为解码线程发送(收包回调里直接发会 SIGSEGV), 并加 recv 生命周期锁
 //
 #include <jni.h>
 #include <android/log.h>
@@ -109,6 +110,10 @@ struct YangAndroidRtc {
 	volatile int64_t statDec;
 	volatile int64_t statDrop;
 	volatile int64_t lastPliMs;	// PLI 限频
+	// 备注(2026-11-19): PLI 不能在收包回调里同步发送(会重入 RTC 栈导致 SIGSEGV),
+	// 只置标志由解码线程发送; recvLock 保护 recv 指针的生命周期
+	pthread_mutex_t recvLock;
+	volatile int32_t pliPending;
 
 	YangAndroidRtc() {
 		pubCtx = NULL;
@@ -130,8 +135,10 @@ struct YangAndroidRtc {
 		statDec = 0;
 		statDrop = 0;
 		lastPliMs = 0;
+		pliPending = 0;
 		qHead = qTail = qCount = 0;
 		memset(qPkts, 0, sizeof(qPkts));
+		pthread_mutex_init(&recvLock, NULL);
 		pthread_mutex_init(&decLock, NULL);
 		pthread_mutex_init(&qLock, NULL);
 		pthread_cond_init(&qCond, NULL);
@@ -144,6 +151,7 @@ struct YangAndroidRtc {
 			delete render;
 			render = NULL;
 		}
+		pthread_mutex_destroy(&recvLock);
 		pthread_mutex_destroy(&decLock);
 		pthread_mutex_destroy(&qLock);
 		pthread_cond_destroy(&qCond);
@@ -224,22 +232,33 @@ static void queueClear(YangAndroidRtc *rtc) {
 	pthread_mutex_unlock(&rtc->qLock);
 }
 
-// 主动请求关键帧(PLI), 让对端尽快重发 IDR, 缩短丢帧后的恢复时间
-// 1 秒内最多请求一次, 避免拥塞时 PLI 风暴(IDR 本身也很大)
+// 请求关键帧(PLI)。
+// 注意: 该函数会被收包回调调用, 绝不能在回调里直接发 RTCP ——
+// 会重入 RTC 栈(实测 SIGSEGV), 这里只置标志, 由解码线程真正发送。
 static void requestKeyFrame(YangAndroidRtc *rtc) {
+	rtc->pliPending = 1;
+}
+
+// 由解码线程调用: 限频 1 秒真正发出 PLI
+static void flushKeyFrameRequest(YangAndroidRtc *rtc) {
 	struct timespec ts;
 	int64_t nowMs;
 
-	if (rtc->recv == NULL || rtc->recv->sendRequestPli == NULL)
+	if (!rtc->pliPending)
 		return;
 
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	nowMs = (int64_t) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 	if (rtc->lastPliMs != 0 && nowMs - rtc->lastPliMs < 1000)
-		return;
-	rtc->lastPliMs = nowMs;
+		return;	// 保留 pending, 稍后再发
 
-	rtc->recv->sendRequestPli(&rtc->recv->peer);
+	rtc->lastPliMs = nowMs;
+	rtc->pliPending = 0;
+
+	pthread_mutex_lock(&rtc->recvLock);
+	if (rtc->recv != NULL && rtc->recv->sendRequestPli != NULL)
+		rtc->recv->sendRequestPli(&rtc->recv->peer);
+	pthread_mutex_unlock(&rtc->recvLock);
 }
 
 // 入队。溢出时不再丢单个 P 帧(会破坏参考链导致花屏),
@@ -350,6 +369,9 @@ static void *decodeThreadRun(void *arg) {
 			pthread_mutex_unlock(&rtc->decLock);
 			free(pkt.data);
 		}
+
+		// 需要补关键帧时, 由本线程(而不是收包线程)发送 PLI
+		flushKeyFrameRequest(rtc);
 
 		clock_gettime(CLOCK_MONOTONIC, &nowTs);
 		int64_t elapsedMs = (nowTs.tv_sec - lastTs.tv_sec) * 1000
@@ -475,9 +497,7 @@ static void *playThreadRun(void *arg) {
 	while (rtc->playing)
 		usleep(100 * 1000);
 
-	if (rtc->recv != NULL)
-		rtc->recv->close(&rtc->recv->peer);
-
+	// 先停解码线程(它可能正在发 PLI), 再关连接, 避免关闭过程中被并发访问
 	rtc->decRunning = 0;
 	pthread_mutex_lock(&rtc->qLock);
 	pthread_cond_broadcast(&rtc->qCond);
@@ -487,6 +507,11 @@ static void *playThreadRun(void *arg) {
 		rtc->decStarted = 0;
 	}
 	queueClear(rtc);
+
+	pthread_mutex_lock(&rtc->recvLock);
+	if (rtc->recv != NULL)
+		rtc->recv->close(&rtc->recv->peer);
+	pthread_mutex_unlock(&rtc->recvLock);
 
 	pthread_mutex_lock(&rtc->decLock);
 	dec = rtc->dec;
@@ -568,8 +593,10 @@ void YangAndroidRtc::stopPlay() {
 	}
 
 	if (recv != NULL) {
+		pthread_mutex_lock(&recvLock);
 		free(recv);
 		recv = NULL;
+		pthread_mutex_unlock(&recvLock);
 	}
 	if (playCtx != NULL) {
 		delete playCtx;

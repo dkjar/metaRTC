@@ -172,6 +172,10 @@ adb logcat -s YangRtcJni | grep -E "decoder=|remote video|play stats|fallback"
 - **修复快速运动花屏**：解码队列溢出时不再丢单个 P 帧（丢中间帧会导致后续帧
   失去参考而花屏），改为清空队列并丢弃到下一个关键帧，同时发送 PLI 请求 IDR
   （1 秒限频）；解码器连续取不到输出时也会请求 PLI
+- **修复崩溃（SIGSEGV）**：PLI 不能在 RTP 收包回调里同步发送（会重入 RTC 栈，
+  实测 `yang_pulltrackH264_on_rtp → yang_put_frame_video → requestKeyFrame` 崩溃）。
+  改为只置标志、由解码线程发送，并用 `recvLock` 保护连接对象的生命周期；
+  停止播放时先停解码线程再关闭连接
 
 ### 2026-11-16 拉流管线优化
 
