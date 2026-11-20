@@ -161,6 +161,30 @@ adb logcat -s YangRtcJni | grep -E "decoder=|remote video|play stats|fallback"
 
 ## 修改记录
 
+### 2026-11-20 PLI 空指针崩溃修复
+
+- 根据新 tombstone 的 PC `0x1edbac` 与匹配 BuildId 反查，崩溃位于
+  `flushKeyFrameRequest → sendRequestPli`，并非 MediaCodec 的 `TRY_AGAIN` 本身
+- 根因是外层 `YangPeerConnection.sendRequestPli` 虽已赋值，但底层
+  `YangRtcConnection.sendRequestPli` 未在 `yang_create_rtcConnection` 中初始化，
+  最终跳转到空地址（`fault addr 0x0`）
+- PLI 改用 metaRTC 解码器框架已有的 `sendRtcMessage(YangRTC_Decoder_Error)` 路径，
+  发送前检查连接状态和回调；保留解码线程异步发送、1 秒限频及连接生命周期锁
+
+### 2026-11-20 播放控件 KitePlayer 风格改造
+
+- 播放内核仍为 metaRTC WHEP（KitePlayer 引擎基于 FFmpeg/HTTP，不能播 WebRTC，
+  且其 compose 模块要求 Compose 1.13 + compileSdk 37，与当前工具链不兼容），
+  因此只参考其 UI：在 `SurfaceView` 之上用 Compose 叠加控制层
+- 新增 `RemotePlayer` 控件：点击显隐 + 3 秒自动隐藏、中央播放/停止大按钮、
+  底部 LIVE 红点 + 已播时长 + 分辨率 + 硬解/软解 + 全屏切换、顶部流名标题栏
+- 状态叠层：连接中（转圈）、错误（提示 + 重试）；播放中常驻 rx/dec/drop 统计条
+- 全屏切换只改变外层 `Modifier`，不重建 `SurfaceView`，避免 native 持有的
+  `ANativeWindow` 失效；全屏时隐藏系统栏
+- 新增 JNI `getPlayStats()`（`long[8]`：累计 rx/dec/drop、宽高、解码器类型、
+  连接/播放状态），Kotlin 每秒轮询计算速率；开始播放时 native 侧清零统计
+- 依赖新增 `androidx.compose.material:material-icons-extended`（播放/暂停/全屏图标）
+
 ### 2026-11-19 拉流卡顿排查
 
 - 修复 `AMediaCodec_start` 返回值未检查：此前 start 失败也会把 `m_isInit` 置 1，
@@ -172,10 +196,8 @@ adb logcat -s YangRtcJni | grep -E "decoder=|remote video|play stats|fallback"
 - **修复快速运动花屏**：解码队列溢出时不再丢单个 P 帧（丢中间帧会导致后续帧
   失去参考而花屏），改为清空队列并丢弃到下一个关键帧，同时发送 PLI 请求 IDR
   （1 秒限频）；解码器连续取不到输出时也会请求 PLI
-- **修复崩溃（SIGSEGV）**：PLI 不能在 RTP 收包回调里同步发送（会重入 RTC 栈，
-  实测 `yang_pulltrackH264_on_rtp → yang_put_frame_video → requestKeyFrame` 崩溃）。
-  改为只置标志、由解码线程发送，并用 `recvLock` 保护连接对象的生命周期；
-  停止播放时先停解码线程再关闭连接
+- PLI 改为只置标志、由解码线程异步发送，并用 `recvLock` 保护连接对象的生命周期；
+  停止播放时先停解码线程再关闭连接。后续空指针根因修复见 2026-11-20 记录
 
 ### 2026-11-16 拉流管线优化
 

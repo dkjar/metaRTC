@@ -9,7 +9,9 @@
 //               硬解改为 Surface 直出; RTP 90kHz 时间戳转微秒后再给 MediaCodec
 //   2026-11-19  增加 rx/dec/drop 每 5 秒统计日志, 用于定位拉流卡顿;
 //               队列溢出改为「丢到下一个关键帧 + 请求 PLI」, 修复快速运动花屏;
-//               PLI 改为解码线程发送(收包回调里直接发会 SIGSEGV), 并加 recv 生命周期锁
+//               PLI 改为解码线程异步发送, 并加 recv 生命周期锁
+//   2026-11-20  PLI 改用 sendRtcMessage(YangRTC_Decoder_Error): 原 sendRequestPli
+//               的底层函数指针未初始化, 调用会跳转到空地址导致 SIGSEGV
 //
 #include <jni.h>
 #include <android/log.h>
@@ -256,8 +258,13 @@ static void flushKeyFrameRequest(YangAndroidRtc *rtc) {
 	rtc->pliPending = 0;
 
 	pthread_mutex_lock(&rtc->recvLock);
-	if (rtc->recv != NULL && rtc->recv->sendRequestPli != NULL)
-		rtc->recv->sendRequestPli(&rtc->recv->peer);
+	// 备注(2026-11-20): sendRequestPli 的底层 YangRtcConnection.sendRequestPli
+	// 在 yang_create_rtcConnection 中未赋值, 直接调用会跳转到 0x0。
+	// 使用 metaRTC 解码器框架同款的 notify 路径发送 PLI, 并先确认已连接。
+	if (rtc->recv != NULL && rtc->recv->sendRtcMessage != NULL
+			&& rtc->recv->isConnected != NULL
+			&& rtc->recv->isConnected(&rtc->recv->peer))
+		rtc->recv->sendRtcMessage(&rtc->recv->peer, YangRTC_Decoder_Error);
 	pthread_mutex_unlock(&rtc->recvLock);
 }
 
@@ -539,6 +546,12 @@ static int32_t playStart(YangAndroidRtc *rtc, const char *url, ANativeWindow *wi
 	rtc->skipUntilKey = 0;
 	rtc->cb.width = 0;
 	rtc->cb.height = 0;
+	// 备注(2026-11-20): 新一次拉流前清零统计, 供上层 getPlayStats 计算速率
+	rtc->statRx = 0;
+	rtc->statDec = 0;
+	rtc->statDrop = 0;
+	rtc->lastPliMs = 0;
+	rtc->pliPending = 0;
 
 	rtc->playCtx = new YangContext();
 	rtc->playCtx->init();
@@ -738,4 +751,40 @@ Java_org_meta_rtc_YangRtcNative_stopPlay(JNIEnv *env, jclass clazz, jlong handle
 	YangAndroidRtc *rtc = asRtc(handle);
 	if (rtc != NULL)
 		rtc->stopPlay();
+}
+
+// 备注(2026-11-20): 供 UI 层轮询的播放统计。
+// 返回 long[8] = { rx累计, dec累计, drop累计, 宽, 高, 解码器类型, 已连接, 播放中 }
+//   解码器类型: 1=MediaCodec 硬解, 0=FFmpeg 软解, -1=未初始化
+extern "C" JNIEXPORT jlongArray JNICALL
+Java_org_meta_rtc_YangRtcNative_getPlayStats(JNIEnv *env, jclass clazz, jlong handle) {
+	(void) clazz;
+	YangAndroidRtc *rtc = asRtc(handle);
+
+	jlongArray arr = env->NewLongArray(8);
+	if (arr == NULL)
+		return NULL;
+
+	jlong vals[8] = { 0, 0, 0, 0, 0, -1, 0, 0 };
+	if (rtc != NULL) {
+		vals[0] = rtc->statRx;
+		vals[1] = rtc->statDec;
+		vals[2] = rtc->statDrop;
+		vals[3] = rtc->cb.width;
+		vals[4] = rtc->cb.height;
+		vals[7] = rtc->playing ? 1 : 0;
+
+		pthread_mutex_lock(&rtc->decLock);
+		if (rtc->playCtx != NULL)
+			vals[5] = rtc->playCtx->avinfo.video.videoDecHwType;
+		pthread_mutex_unlock(&rtc->decLock);
+
+		pthread_mutex_lock(&rtc->recvLock);
+		if (rtc->recv != NULL && rtc->recv->isConnected != NULL)
+			vals[6] = rtc->recv->isConnected(&rtc->recv->peer) ? 1 : 0;
+		pthread_mutex_unlock(&rtc->recvLock);
+	}
+
+	env->SetLongArrayRegion(arr, 0, 8, vals);
+	return arr;
 }

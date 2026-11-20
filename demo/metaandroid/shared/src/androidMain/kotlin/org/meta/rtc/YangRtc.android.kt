@@ -42,6 +42,11 @@ actual class YangRtc actual constructor() {
         YangRtcNative.stopPlay(handle)
     }
 
+    actual fun getPlayStats(): LongArray {
+        if (handle == 0L) return LongArray(8) { if (it == 5) -1L else 0L }
+        return YangRtcNative.getPlayStats(handle)
+    }
+
     actual fun release() {
         if (handle == 0L) return
         YangRtcNative.destroy(handle)
@@ -78,4 +83,7 @@ internal object YangRtcNative {
 
     @JvmStatic
     external fun stopPlay(handle: Long)
+
+    @JvmStatic
+    external fun getPlayStats(handle: Long): LongArray
 }

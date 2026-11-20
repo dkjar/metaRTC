@@ -20,7 +20,7 @@ kotlin {
 
 android {
     namespace = "org.meta.rtc"
-    compileSdk = 36
+    compileSdk = 37 // 2026-11-20 对齐 KitePlayer
 
     defaultConfig {
         minSdk = 29

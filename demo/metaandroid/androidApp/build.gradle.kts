@@ -11,8 +11,9 @@ val metaRtcRoot: String = rootProject.projectDir.parentFile.parentFile.absoluteP
 
 android {
     namespace = "org.meta.rtc.demo"
-    compileSdk = 36
-    buildToolsVersion = "36.0.0"
+    // 2026-11-20 对齐 KitePlayer: compileSdk 37(Compose 1.13 的 AAR 元数据硬性要求)
+    compileSdk = 37
+    buildToolsVersion = "37.0.0"
     ndkVersion = "25.1.8937393"
 
     defaultConfig {
@@ -69,10 +70,13 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 
-    implementation(platform("androidx.compose:compose-bom:2024.09.02"))
+    // 2026-11-20 对齐 KitePlayer Compose 1.13(BOM 2026.09.00, 需 compileSdk 37)
+    implementation(platform("androidx.compose:compose-bom:2026.09.00"))
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
+    // 播放控件图标（播放/暂停/全屏等），版本由 compose-bom 统一管理
+    implementation("androidx.compose.material:material-icons-extended")
     debugImplementation("androidx.compose.ui:ui-tooling")
 
     implementation("androidx.camera:camera-core:1.3.4")

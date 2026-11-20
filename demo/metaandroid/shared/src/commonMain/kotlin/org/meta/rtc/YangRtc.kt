@@ -26,6 +26,16 @@ expect class YangRtc() {
      */
     fun sendH264Frame(data: ByteArray, ptsUs: Long, keyFrame: Boolean): Int
 
+    /**
+     * 轮询拉流统计（用于播放控件显示运行状态）。
+     *
+     * 返回 `long[8]` = { 累计收帧 rx, 累计解码 dec, 累计丢帧 drop,
+     *                   宽度, 高度, 解码器类型(1=硬解/0=软解/-1=未初始化),
+     *                   是否已连接(0/1), 是否播放中(0/1) }。
+     * 两次调用的差值即为对应速率。
+     */
+    fun getPlayStats(): LongArray
+
     /** 释放全部 native 资源 */
     fun release()
 }

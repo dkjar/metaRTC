@@ -3,9 +3,6 @@ package org.meta.rtc.demo
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Bundle
-import android.view.Surface
-import android.view.SurfaceHolder
-import android.view.SurfaceView
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -22,7 +19,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
@@ -38,6 +34,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
@@ -75,7 +72,7 @@ private fun MainScreen() {
         mutableStateOf("http://47.76.137.109:1985/rtc/v1/whip/?app=live&stream=livestream")
     }
     var whepUrl by remember {
-        mutableStateOf("http://47.76.137.109:1985/rtc/v1/whep/?app=live&stream=livestream")
+        mutableStateOf("http://192.168.100.188:1985/rtc/v1/whep/?app=live&stream=livestream")
     }
 
     val rtc = remember { YangRtc() }
@@ -86,7 +83,7 @@ private fun MainScreen() {
     }
 
     var publishing by remember { mutableStateOf(false) }
-    var playing by remember { mutableStateOf(false) }
+    var fullscreen by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("就绪") }
     var hasCamera by remember {
         mutableStateOf(
@@ -96,7 +93,6 @@ private fun MainScreen() {
     }
 
     var previewView by remember { mutableStateOf<PreviewView?>(null) }
-    var surface by remember { mutableStateOf<Surface?>(null) }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -109,12 +105,10 @@ private fun MainScreen() {
         if (!hasCamera) permissionLauncher.launch(Manifest.permission.CAMERA)
     }
 
-    // 每秒刷新一次状态
-    LaunchedEffect(publishing, playing) {
-        while (publishing || playing) {
-            if (publishing) {
-                status = "推流中：${encoder.frameCount} 帧（关键帧 ${encoder.keyFrameCount}）"
-            }
+    // 推流状态每秒刷新
+    LaunchedEffect(publishing) {
+        while (publishing) {
+            status = "推流中：${encoder.frameCount} 帧（关键帧 ${encoder.keyFrameCount}）"
             delay(1000)
         }
     }
@@ -127,149 +121,106 @@ private fun MainScreen() {
         }
     }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(12.dp)
-            .verticalScroll(rememberScrollState())
-    ) {
-        Text("metaRTC 全链路 WebRTC 直播", style = MaterialTheme.typography.titleMedium)
-
-        Spacer(Modifier.height(8.dp))
-        OutlinedTextField(
-            value = whipUrl,
-            onValueChange = { whipUrl = it },
-            label = { Text("WHIP 推流地址") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth()
-        )
-        Spacer(Modifier.height(6.dp))
-        OutlinedTextField(
-            value = whepUrl,
-            onValueChange = { whepUrl = it },
-            label = { Text("WHEP 拉流地址") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth()
-        )
-
-        Spacer(Modifier.height(8.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(
-                enabled = !publishing && hasCamera,
-                onClick = {
-                    val pv = previewView
-                    if (pv == null) {
-                        status = "预览未就绪"
-                        return@Button
-                    }
-                    scope.launch {
-                        status = "正在连接 SRS ..."
-                        val ret = withContext(Dispatchers.IO) { rtc.startPublish(whipUrl) }
-                        if (ret != 0) {
-                            status = "推流建链失败($ret)"
-                            return@launch
-                        }
-                        encoder.start(lifecycleOwner, pv)
-                        publishing = true
-                        status = "推流中"
-                    }
-                }
-            ) { Text("开始推流") }
-
-            Button(
-                enabled = publishing,
-                onClick = {
-                    encoder.stop()
-                    rtc.stopPublish()
-                    publishing = false
-                    status = "推流已停止"
-                }
-            ) { Text("停止推流") }
-        }
-
-        Spacer(Modifier.height(8.dp))
-        Text("摄像头预览", style = MaterialTheme.typography.labelLarge)
-        Box(
+    // 根布局用 Box：推送内容在底层，播放控件悬浮在底部，全屏时铺满并覆盖上层内容。
+    // RemotePlayer 始终只组合一次，全屏切换只改 Modifier，避免 SurfaceView 重建。
+    Box(modifier = Modifier.fillMaxSize()) {
+        Column(
             modifier = Modifier
-                .fillMaxWidth()
-                .height(170.dp)
-                .background(Color.Black)
+                .fillMaxSize()
+                .padding(12.dp)
+                .verticalScroll(rememberScrollState())
+                // 为底部悬浮的播放控件预留空间，避免被遮挡
+                .padding(bottom = if (fullscreen) 0.dp else 256.dp)
         ) {
-            AndroidView(
-                modifier = Modifier.fillMaxSize(),
-                factory = { ctx ->
-                    PreviewView(ctx).also { previewView = it }
-                }
-            )
-        }
+            Text("metaRTC 全链路 WebRTC 直播", style = MaterialTheme.typography.titleMedium)
 
-        Spacer(Modifier.height(10.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(
-                enabled = !playing && surface != null,
-                onClick = {
-                    val s = surface ?: return@Button
-                    scope.launch {
-                        status = "正在拉流 ..."
-                        val ret = withContext(Dispatchers.IO) { rtc.startPlay(whepUrl, s) }
-                        if (ret != 0) {
-                            status = "拉流失败($ret)"
-                            return@launch
+            Spacer(Modifier.height(8.dp))
+            OutlinedTextField(
+                value = whipUrl,
+                onValueChange = { whipUrl = it },
+                label = { Text("WHIP 推流地址") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(6.dp))
+            OutlinedTextField(
+                value = whepUrl,
+                onValueChange = { whepUrl = it },
+                label = { Text("WHEP 拉流地址") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    enabled = !publishing && hasCamera,
+                    onClick = {
+                        val pv = previewView
+                        if (pv == null) {
+                            status = "预览未就绪"
+                            return@Button
                         }
-                        playing = true
-                        status = "拉流中"
+                        scope.launch {
+                            status = "正在连接 SRS ..."
+                            val ret = withContext(Dispatchers.IO) { rtc.startPublish(whipUrl) }
+                            if (ret != 0) {
+                                status = "推流建链失败($ret)"
+                                return@launch
+                            }
+                            encoder.start(lifecycleOwner, pv)
+                            publishing = true
+                            status = "推流中"
+                        }
                     }
-                }
-            ) { Text("开始播放") }
+                ) { Text("开始推流") }
 
-            Button(
-                enabled = playing,
-                onClick = {
-                    rtc.stopPlay()
-                    playing = false
-                    status = "播放已停止"
-                }
-            ) { Text("停止播放") }
+                Button(
+                    enabled = publishing,
+                    onClick = {
+                        encoder.stop()
+                        rtc.stopPublish()
+                        publishing = false
+                        status = "推流已停止"
+                    }
+                ) { Text("停止推流") }
+            }
 
-            Spacer(Modifier.width(4.dp))
+            Spacer(Modifier.height(8.dp))
+            Text("摄像头预览", style = MaterialTheme.typography.labelLarge)
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(170.dp)
+                    .background(Color.Black)
+            ) {
+                AndroidView(
+                    modifier = Modifier.fillMaxSize(),
+                    factory = { ctx ->
+                        PreviewView(ctx).also { previewView = it }
+                    }
+                )
+            }
+
+            Spacer(Modifier.height(10.dp))
+            Text("远端画面（KitePlayer 风格控件）", style = MaterialTheme.typography.labelLarge)
+            Spacer(Modifier.height(6.dp))
+            Text(status, style = MaterialTheme.typography.bodySmall)
+            Spacer(Modifier.height(16.dp))
         }
 
-        Spacer(Modifier.height(8.dp))
-        Text("远端画面", style = MaterialTheme.typography.labelLarge)
-        Box(
-            modifier = Modifier
+        RemotePlayer(
+            rtc = rtc,
+            whepUrl = whepUrl,
+            fullscreen = fullscreen,
+            onToggleFullscreen = { fullscreen = !fullscreen },
+            onStatus = { status = it },
+            modifier = if (fullscreen) Modifier.fillMaxSize()
+            else Modifier
+                .align(Alignment.BottomCenter)
                 .fillMaxWidth()
-                .height(230.dp)
-                .background(Color.Black)
-        ) {
-            AndroidView(
-                modifier = Modifier.fillMaxSize(),
-                factory = { ctx ->
-                    SurfaceView(ctx).apply {
-                        holder.addCallback(object : SurfaceHolder.Callback {
-                            override fun surfaceCreated(holder: SurfaceHolder) {
-                                surface = holder.surface
-                            }
-
-                            override fun surfaceChanged(
-                                holder: SurfaceHolder,
-                                format: Int,
-                                width: Int,
-                                height: Int
-                            ) {
-                            }
-
-                            override fun surfaceDestroyed(holder: SurfaceHolder) {
-                                surface = null
-                            }
-                        })
-                    }
-                }
-            )
-        }
-
-        Spacer(Modifier.height(10.dp))
-        Text(status, style = MaterialTheme.typography.bodySmall)
-        Spacer(Modifier.height(16.dp))
+                .height(248.dp)
+                .padding(horizontal = 12.dp, vertical = 8.dp)
+        )
     }
 }
